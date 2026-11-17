@@ -23,13 +23,56 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import pysam
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import RedirectResponse
 
 from .db import Conflict, Store
+from .lift import (
+    FastaError,
+    MappingError,
+    check_mappings,
+    lift_records,
+    parse_fasta,
+    parse_mappings,
+)
 from .vcfbuild import GZ_NAME, VCFError, validate_and_build
 
 DEFAULT_MAX_UPLOAD = 10 * 1024 * 1024  # 10 MiB
+
+
+def _fetch_intersecting(gz_path: str, chrom: str, start: int, end: int) -> list[str]:
+    """Return raw records whose REF span intersects the 1-based closed interval.
+
+    Fetching goes through the Tabix index; the per-record span check on top of
+    the index iterator makes the closed-interval semantics exact (a deletion
+    starting before `start` is still returned when it reaches into the range).
+    """
+    tb = pysam.TabixFile(gz_path)
+    try:
+        records = []
+        for ln in tb.fetch(chrom, start - 1, end):
+            f = ln.split("\t", 4)
+            pos = int(f[1])
+            if pos <= end and pos + len(f[3]) - 1 >= start:
+                records.append(ln)
+        return records
+    finally:
+        tb.close()
+
+
+async def _read_limited(file: UploadFile, limit: int) -> bytes:
+    """Read an upload in chunks, rejecting anything over `limit` bytes."""
+    chunks = []
+    size = 0
+    while True:
+        chunk = await file.read(1 << 20)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(413, f"upload exceeds the {limit}-byte limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @dataclass
@@ -144,7 +187,11 @@ def create_app(config: Config | None = None) -> FastAPI:
             "Tabix-indexed. Query 1-based closed intervals; every record whose "
             "reference span [POS, POS+len(REF)-1] intersects the interval is "
             "returned via the index. Uploads are optimistic-concurrency "
-            "controlled through `base_version`."
+            "controlled through `base_version`. `POST /lift` converts equal-"
+            "length substitution records from the published assembly to a "
+            "target reference through up to 100 gapless source->target "
+            "interval mappings, honouring strand, and only reports a target "
+            "variant when exactly one candidate matches the target FASTA."
         ),
     )
     app.state.cfg = cfg
@@ -222,19 +269,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 )
             gz_path = os.path.join(cfg.data_dir, rel, GZ_NAME)
             try:
-                tb = pysam.TabixFile(gz_path)
-                try:
-                    # 1-based closed [start, end] -> 0-based half-open fetch.
-                    lines = tb.fetch(vchrom, start - 1, end)
-                    records = []
-                    for ln in lines:
-                        f = ln.split("\t", 4)
-                        pos = int(f[1])
-                        # Exact span check on top of the index iterator.
-                        if pos <= end and pos + len(f[3]) - 1 >= start:
-                            records.append(ln)
-                finally:
-                    tb.close()
+                records = _fetch_intersecting(gz_path, vchrom, start, end)
             except HTTPException:
                 raise
             except Exception as exc:
@@ -249,6 +284,84 @@ def create_app(config: Config | None = None) -> FastAPI:
             }
         finally:
             store.unpin(ref_id)
+
+    @app.post("/lift")
+    async def lift(
+        file: UploadFile = File(..., description="Single-chromosome target FASTA"),
+        mappings: str = Form(
+            ...,
+            description=(
+                "JSON array of at most 100 objects: "
+                "{source_start, source_end, target_chrom, target_start, "
+                "target_end, strand} with 1-based closed intervals, equal lengths, "
+                "strand '+' or '-'."
+            ),
+        ),
+        chrom: str = Query(..., description="Source chromosome as in the VCF"),
+        start: int = Query(..., ge=1, description="1-based source interval start"),
+        end: int = Query(..., ge=1, description="1-based source interval end"),
+    ):
+        if end < start:
+            raise HTTPException(400, "end must be >= start")
+
+        # --- validate the request body; any failure is a whole-request error ---
+        try:
+            parsed_mappings = parse_mappings(mappings)
+        except MappingError as exc:
+            raise HTTPException(400, f"invalid mappings: {exc}")
+
+        raw = await _read_limited(file, cfg.max_upload_bytes)
+        try:
+            fasta_name, target_sequence = await asyncio.to_thread(
+                parse_fasta, raw.decode("utf-8", errors="strict")
+            )
+        except UnicodeDecodeError as exc:
+            raise HTTPException(400, f"invalid FASTA: not valid UTF-8 text: {exc}")
+        except FastaError as exc:
+            raise HTTPException(400, f"invalid FASTA: {exc}")
+        try:
+            check_mappings(
+                parsed_mappings, fasta_name=fasta_name, target_length=len(target_sequence)
+            )
+        except MappingError as exc:
+            raise HTTPException(400, f"invalid mappings: {exc}")
+
+        # --- read the published data under a pin, so files cannot vanish ---
+        pinned = store.pin(cfg.instance_id, time.time())
+        if pinned is None:
+            raise HTTPException(404, "no VCF has been published yet")
+        version, vchrom, rel, ref_id = pinned
+        try:
+            if chrom != vchrom:
+                raise HTTPException(
+                    400, f"the published dataset contains chromosome '{vchrom}' only"
+                )
+            gz_path = os.path.join(cfg.data_dir, rel, GZ_NAME)
+            try:
+                lines = await asyncio.to_thread(
+                    _fetch_intersecting, gz_path, vchrom, start, end
+                )
+            except Exception as exc:
+                raise HTTPException(500, f"indexed fetch failed: {exc}")
+            results = await asyncio.to_thread(
+                lift_records, lines, parsed_mappings, target_sequence, version
+            )
+        finally:
+            store.unpin(ref_id)
+
+        lifted = [r for r in results if r["status"] == "lifted"]
+        return {
+            "version": version,
+            "source": {
+                "chrom": vchrom,
+                "start": start,
+                "end": end,
+                "fasta_name": fasta_name,
+            },
+            "n_records": len(results),
+            "n_lifted": len(lifted),
+            "results": results,
+        }
 
     @app.get("/version")
     def get_version():
